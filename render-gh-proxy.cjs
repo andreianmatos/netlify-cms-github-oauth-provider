@@ -1,6 +1,10 @@
 /**
  * Proxy GitHub API for AVV admin (browser → this server → api.github.com).
+ * Uses Node https (no fetch) for compatibility with older Render Node runtimes.
  */
+const https = require("https");
+const { URL } = require("url");
+
 module.exports = function mountGhProxy(app) {
   const express = require("express");
   const rawOrigins = (process.env.ORIGINS || "")
@@ -15,6 +19,43 @@ module.exports = function mountGhProxy(app) {
     const host = origin.replace(/^https?:\/\//i, "").replace(/\/.*$/, "");
     return rawOrigins.some(function (allowed) {
       return host === allowed || host.endsWith("." + allowed);
+    });
+  }
+
+  function githubPath(req) {
+    const raw = req.originalUrl || req.url || "";
+    let path = raw.replace(/^\/gh(?=\/|$)/, "");
+    if (!path || path === "") path = "/";
+    if (path.charAt(0) !== "/") path = "/" + path;
+    return path;
+  }
+
+  function upstreamRequest(targetUrl, method, headers, body) {
+    return new Promise(function (resolve, reject) {
+      const u = new URL(targetUrl);
+      const opts = {
+        hostname: u.hostname,
+        port: 443,
+        path: u.pathname + u.search,
+        method: method,
+        headers: Object.assign({}, headers, { Host: u.hostname }),
+      };
+      const req = https.request(opts, function (upstream) {
+        const chunks = [];
+        upstream.on("data", function (chunk) {
+          chunks.push(chunk);
+        });
+        upstream.on("end", function () {
+          resolve({
+            status: upstream.statusCode || 502,
+            headers: upstream.headers,
+            body: Buffer.concat(chunks).toString("utf8"),
+          });
+        });
+      });
+      req.on("error", reject);
+      if (body) req.write(body);
+      req.end();
     });
   }
 
@@ -41,37 +82,42 @@ module.exports = function mountGhProxy(app) {
     next();
   });
 
-  gh.all(/.*/, async function (req, res) {
+  gh.all(/.*/, function (req, res) {
     const auth = req.headers.authorization;
     if (!auth) {
       return res.status(401).json({ message: "Authorization required" });
     }
-    const ghPath = req.originalUrl.replace(/^\/gh/, "") || req.url;
-    const url = "https://api.github.com" + ghPath;
-    const init = {
-      method: req.method,
-      headers: {
-        Accept: req.headers.accept || "application/vnd.github+json",
-        Authorization: auth,
-        "X-GitHub-Api-Version": req.headers["x-github-api-version"] || "2022-11-28",
-        "User-Agent": "avv-oauth-gh-proxy",
-      },
+
+    const ghPath = githubPath(req);
+    const targetUrl = "https://api.github.com" + ghPath;
+    const headers = {
+      Accept: req.headers.accept || "application/vnd.github+json",
+      Authorization: auth,
+      "X-GitHub-Api-Version": req.headers["x-github-api-version"] || "2022-11-28",
+      "User-Agent": "avv-oauth-gh-proxy",
     };
+
+    let body = null;
     if (req.method !== "GET" && req.method !== "HEAD" && req.body && Object.keys(req.body).length) {
-      init.body = JSON.stringify(req.body);
-      init.headers["Content-Type"] = "application/json";
+      body = JSON.stringify(req.body);
+      headers["Content-Type"] = "application/json";
+      headers["Content-Length"] = Buffer.byteLength(body);
     }
-    try {
-      const upstream = await fetch(url, init);
-      const text = await upstream.text();
-      res.status(upstream.status);
-      const ct = upstream.headers.get("content-type");
-      if (ct) res.setHeader("Content-Type", ct);
-      res.send(text);
-    } catch (error) {
-      console.error("gh-proxy", error);
-      res.status(502).json({ message: "GitHub proxy error" });
-    }
+
+    upstreamRequest(targetUrl, req.method, headers, body)
+      .then(function (upstream) {
+        res.status(upstream.status);
+        const ct = upstream.headers["content-type"];
+        if (ct) res.setHeader("Content-Type", ct);
+        res.send(upstream.body);
+      })
+      .catch(function (error) {
+        console.error("gh-proxy", error && error.message ? error.message : error);
+        res.status(502).json({
+          message: "GitHub proxy error",
+          detail: error && error.message ? error.message : "upstream_failed",
+        });
+      });
   });
 
   app.use("/gh", gh);
