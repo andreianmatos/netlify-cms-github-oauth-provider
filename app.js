@@ -15,6 +15,8 @@ app.get('/callback', middleWarez.callback)
 app.get('/success', middleWarez.success)
 app.get('/', middleWarez.index)
 
+require('./render-gh-proxy.cjs')(app)
+
 app.listen(port, () => {
   console.log("Netlify CMS OAuth provider listening on port " + port)
 })
